@@ -41,6 +41,71 @@ from dotenv import load_dotenv
 # ---------------------------------------------------------------------------
 
 
+MINUS_TRANSLATION = str.maketrans(
+    {
+        "−": "-",  # математический минус
+        "–": "-",  # короткое тире
+        "—": "-",  # длинное тире
+        "‑": "-",  # неразрывный дефис
+        "﹣": "-",
+        "－": "-",
+    }
+)
+
+
+def parse_env_int(
+    raw: str | None,
+    variable_name: str,
+    *,
+    group_chat: bool = False,
+) -> int | None:
+    """Надёжно читает числовой ID из переменной окружения.
+
+    Принимает обычное число, число в кавычках и запись вида
+    ``WORK_CHAT_ID=-123``. Для ID групп положительное значение
+    автоматически преобразуется в отрицательное.
+    """
+    value = (raw or "").strip().translate(MINUS_TRANSLATION)
+    if not value:
+        return None
+
+    if "=" in value:
+        left, right = value.split("=", 1)
+        if left.strip().upper() == variable_name.upper():
+            value = right
+
+    value = value.strip().strip("\"'").replace("\u00a0", "").replace(" ", "")
+    if not value:
+        return None
+    if not re.fullmatch(r"[+-]?\d+", value):
+        raise RuntimeError(
+            f"Переменная {variable_name} должна содержать только числовой ID, "
+            f"получено: {raw!r}"
+        )
+
+    result = int(value)
+    if result == 0:
+        raise RuntimeError(f"Переменная {variable_name} не может быть равна 0")
+    if group_chat and result > 0:
+        logging.warning(
+            "%s указан без минуса (%s). Использую значение -%s.",
+            variable_name,
+            result,
+            result,
+        )
+        result = -result
+    return result
+
+
+def is_configured_work_chat(chat_id: int, configured_chat_id: int | None) -> bool:
+    """Проверяет, совпадает ли текущая группа с WORK_CHAT_ID."""
+    if configured_chat_id is None:
+        return False
+    return chat_id == configured_chat_id or (
+        chat_id < 0 and abs(chat_id) == abs(configured_chat_id)
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class Settings:
     bot_token: str
@@ -65,15 +130,19 @@ class Settings:
         except ZoneInfoNotFoundError as exc:
             raise RuntimeError(f"Неизвестный часовой пояс TIMEZONE={timezone_name}") from exc
 
-        work_chat_raw = os.getenv("WORK_CHAT_ID", "").strip()
-        work_chat_id = int(work_chat_raw) if work_chat_raw else None
+        work_chat_id = parse_env_int(
+            os.getenv("WORK_CHAT_ID", ""),
+            "WORK_CHAT_ID",
+            group_chat=True,
+        )
 
         def parse_ids(raw: str) -> frozenset[int]:
             result: set[int] = set()
-            for value in raw.split(","):
-                value = value.strip()
-                if value:
-                    result.add(int(value))
+            normalized = raw.replace(";", ",").replace("\n", ",")
+            for value in normalized.split(","):
+                parsed = parse_env_int(value, "ID")
+                if parsed is not None:
+                    result.add(parsed)
             return frozenset(result)
 
         admin_ids = parse_ids(os.getenv("ADMIN_IDS", ""))
@@ -1025,8 +1094,14 @@ class Database:
 
     async def cancel_reminder(self, reminder_id: int, creator_id: int | None = None) -> bool:
         if creator_id is None:
-            changed = await self.execute("UPDATE reminders SET cancelled=1 WHERE id=?", (reminder_id,))
-            return changed >= 0
+            row = await self.fetchone("SELECT id FROM reminders WHERE id=?", (reminder_id,))
+            if not row:
+                return False
+            await self.execute(
+                "UPDATE reminders SET cancelled=1 WHERE id=?",
+                (reminder_id,),
+            )
+            return True
         row = await self.fetchone(
             "SELECT id FROM reminders WHERE id=? AND creator_id=? AND entity_type='custom'",
             (reminder_id, creator_id),
@@ -1438,8 +1513,31 @@ class AccessMiddleware(BaseMiddleware):
             if event.chat.type != ChatType.PRIVATE:
                 if text.startswith("/chatid") and is_admin:
                     return await handler(event, data)
-                if settings.work_chat_id is None or event.chat.id != settings.work_chat_id:
-                    await event.answer("⛔ Этот групповой чат не разрешён для работы бота.")
+                if not is_configured_work_chat(event.chat.id, settings.work_chat_id):
+                    logging.warning(
+                        "Отклонён групповой чат: actual_chat_id=%s, WORK_CHAT_ID=%s, "
+                        "chat_type=%s, user_id=%s",
+                        event.chat.id,
+                        settings.work_chat_id,
+                        event.chat.type,
+                        user.id,
+                    )
+                    if is_admin:
+                        configured = (
+                            str(settings.work_chat_id)
+                            if settings.work_chat_id is not None
+                            else "не задан"
+                        )
+                        await event.answer(
+                            "⛔ Этот групповой чат не разрешён для работы бота.\n"
+                            f"ID текущего чата: <code>{event.chat.id}</code>\n"
+                            f"Загруженный WORK_CHAT_ID: <code>{configured}</code>\n"
+                            "Исправьте переменную и полностью перезапустите бота."
+                        )
+                    else:
+                        await event.answer(
+                            "⛔ Этот групповой чат не разрешён для работы бота."
+                        )
                     return None
 
         if isinstance(event, CallbackQuery):
@@ -1453,8 +1551,18 @@ class AccessMiddleware(BaseMiddleware):
             message = event.message
             chat = getattr(message, "chat", None)
             if chat is not None and chat.type != ChatType.PRIVATE:
-                if settings.work_chat_id is None or chat.id != settings.work_chat_id:
-                    await event.answer("Этот чат не разрешён", show_alert=True)
+                if not is_configured_work_chat(chat.id, settings.work_chat_id):
+                    logging.warning(
+                        "Отклонён callback из группового чата: actual_chat_id=%s, "
+                        "WORK_CHAT_ID=%s, user_id=%s",
+                        chat.id,
+                        settings.work_chat_id,
+                        user.id,
+                    )
+                    await event.answer(
+                        "Этот чат не разрешён. Отправьте /chatid для проверки настроек.",
+                        show_alert=True,
+                    )
                     return None
 
         return await handler(event, data)
@@ -1558,8 +1666,23 @@ async def cmd_id(message: Message) -> None:
 
 
 @router.message(Command("chatid"))
-async def cmd_chat_id(message: Message) -> None:
-    await message.answer(f"ID этого чата: <code>{message.chat.id}</code>")
+async def cmd_chat_id(message: Message, settings: Settings) -> None:
+    configured = (
+        str(settings.work_chat_id)
+        if settings.work_chat_id is not None
+        else "не задан"
+    )
+    if message.chat.type == ChatType.PRIVATE:
+        status = "ℹ️ Это личный чат."
+    elif is_configured_work_chat(message.chat.id, settings.work_chat_id):
+        status = "✅ Текущий чат совпадает с WORK_CHAT_ID."
+    else:
+        status = "❌ Текущий чат НЕ совпадает с WORK_CHAT_ID."
+    await message.answer(
+        f"ID этого чата: <code>{message.chat.id}</code>\n"
+        f"Загруженный WORK_CHAT_ID: <code>{configured}</code>\n"
+        f"{status}"
+    )
 
 
 @router.message(Command("register"))
@@ -2579,7 +2702,15 @@ async def main() -> None:
     await set_bot_commands(bot)
     worker = asyncio.create_task(reminder_worker(bot, db, settings), name="reminder-worker")
     try:
-        logging.info("Бот запущен. Часовой пояс: %s", settings.timezone_name)
+        logging.info(
+            "Бот запущен. TIMEZONE=%s | WORK_CHAT_ID=%s | DB_PATH=%s | "
+            "ADMIN_IDS=%s | ALLOWED_IDS=%s",
+            settings.timezone_name,
+            settings.work_chat_id,
+            settings.db_path,
+            sorted(settings.admin_ids),
+            sorted(settings.allowed_ids),
+        )
         await dp.start_polling(
             bot,
             db=db,
