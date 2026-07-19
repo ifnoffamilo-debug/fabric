@@ -1161,7 +1161,7 @@ def register_extension_handlers(router: Router) -> None:
             await show_object_details(callback.message, state)
 
     @router.callback_query(F.data == "v3_ocreate")
-    async def v3_object_create(callback: CallbackQuery, state: FSMContext, db: Any, settings: Any) -> None:
+    async def v3_object_create(callback: CallbackQuery, state: FSMContext, db: Any, settings: Any, bot: Bot) -> None:
         data = await state.get_data()
         if not data.get("title") or not data.get("category"):
             await callback.answer("Данные создания устарели. Начните заново.", show_alert=True)
@@ -1228,10 +1228,33 @@ def register_extension_handlers(router: Router) -> None:
         await state.clear()
         row = await fetch_object(db, object_id)
         await callback.answer("Объект создан")
+        group_delivery_error = False
+        if row and settings.work_chat_id:
+            source_chat_id = callback.message.chat.id if callback.message else None
+            work_chat_id = int(settings.work_chat_id)
+            if source_chat_id != work_chat_id:
+                try:
+                    await bot.send_message(
+                        chat_id=work_chat_id,
+                        text="🆕 <b>Создан новый объект</b>\n\n" + object_card(row, settings.timezone),
+                        reply_markup=object_actions(row, False),
+                    )
+                except (TelegramBadRequest, TelegramForbiddenError):
+                    group_delivery_error = True
+                    logging.exception(
+                        "Не удалось отправить новый объект №%s в рабочую группу %s",
+                        object_id,
+                        work_chat_id,
+                    )
+
         if callback.message and row:
             admin = await is_admin(callback.from_user.id, db, settings)
             await callback.message.answer(object_card(row, settings.timezone), reply_markup=object_actions(row, admin))
             suffix = f" Задач из шаблона: {created_tasks}." if created_tasks else ""
+            if group_delivery_error:
+                suffix += " ⚠️ В общую группу отправить не удалось — проверьте WORK_CHAT_ID и права бота."
+            elif settings.work_chat_id and callback.message.chat.id != int(settings.work_chat_id):
+                suffix += " Карточка отправлена в рабочую группу."
             await callback.message.answer(f"✅ Объект создан.{suffix}", reply_markup=objects_menu())
 
     @router.callback_query(F.data == "v3_cancel")
