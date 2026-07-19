@@ -442,7 +442,7 @@ def object_details_markup(data: dict[str, Any]) -> InlineKeyboardMarkup:
 def compact_objects_markup(
     rows: Sequence[aiosqlite.Row],
 ) -> InlineKeyboardMarkup:
-    return inline(
+    buttons = [
         [
             (
                 f"{index}. {str(row['title'])[:42]}",
@@ -450,7 +450,8 @@ def compact_objects_markup(
             )
         ]
         for index, row in enumerate(rows, start=1)
-    )
+    ]
+    return inline(buttons)
 
 
 def compact_objects_text(rows: Sequence[aiosqlite.Row], tz: Any, title: str) -> str:
