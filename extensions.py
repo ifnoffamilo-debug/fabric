@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import calendar
 import csv
 import html
 import io
@@ -69,13 +70,19 @@ def money(value: Any) -> str:
 
 
 def parse_amount(text: str) -> Decimal:
+    raw = text.strip().replace(" ", "").replace(",", ".")
     try:
-        amount = Decimal(text.strip().replace(" ", "").replace(",", "."))
+        amount = Decimal(raw)
     except InvalidOperation as exc:
         raise ValueError("Введите сумму числом, например 15000") from exc
+    if not amount.is_finite():
+        raise ValueError("Введите обычное конечное число")
     if amount <= 0:
         raise ValueError("Сумма должна быть больше нуля")
-    return amount.quantize(Decimal("0.01"))
+    try:
+        return amount.quantize(Decimal("0.01"))
+    except InvalidOperation as exc:
+        raise ValueError("Сумма слишком большая или указана неверно") from exc
 
 
 def kb(rows: list[list[str]], placeholder: str = "Выберите действие") -> ReplyKeyboardMarkup:
@@ -243,6 +250,29 @@ def combine_due(day: date, clock: time, tz: Any) -> datetime:
     return value.astimezone(timezone.utc)
 
 
+def add_calendar_month(value: datetime) -> datetime:
+    """Переносит дату на следующий календарный месяц без переполнения дня."""
+    month_index = value.month
+    year = value.year + month_index // 12
+    month = month_index % 12 + 1
+    day = min(value.day, calendar.monthrange(year, month)[1])
+    return value.replace(year=year, month=month, day=day)
+
+
+def next_repeat_due(value: datetime, repeat_rule: str) -> datetime:
+    """Возвращает ближайшую будущую дату для регулярного дела."""
+    candidate = value
+    now = datetime.now(timezone.utc)
+    while candidate <= now:
+        if repeat_rule == "weekly":
+            candidate += timedelta(days=7)
+        elif repeat_rule == "monthly":
+            candidate = add_calendar_month(candidate)
+        else:
+            raise ValueError(f"Неизвестное правило повтора: {repeat_rule}")
+    return candidate
+
+
 async def is_admin(user_id: int, db: Any, settings: Any) -> bool:
     return user_id in settings.admin_ids or await db.is_admin(user_id)
 
@@ -287,16 +317,13 @@ async def list_objects(db: Any, mode: str = "active", query: str | None = None) 
         where.append("o.status='active'")
     elif mode == "completed":
         where.append("o.status IN ('completed','cancelled')")
-    if query:
-        where.append(
-            "(LOWER(o.title) LIKE ? OR LOWER(COALESCE(o.client,'')) LIKE ? "
-            "OR LOWER(COALESCE(o.address,'')) LIKE ? OR COALESCE(o.client_phone,'') LIKE ?)"
-        )
-        pattern = f"%{query.lower()}%"
-        params.extend([pattern, pattern, pattern, f"%{query}%"])
+
     sql_where = " AND ".join(where) if where else "1=1"
-    params.append(60)
-    return await db.fetchall(
+    # Для поиска берём больший набор и фильтруем через casefold в Python.
+    # SQLite по умолчанию не умеет корректно менять регистр кириллицы.
+    limit = 500 if query else 60
+    params.append(limit)
+    rows = await db.fetchall(
         f"""
         SELECT o.*, c.full_name creator_name, r.full_name responsible_name,
                (SELECT COUNT(*) FROM tasks t WHERE t.order_id=o.id AND t.status<>'done') open_tasks,
@@ -314,6 +341,18 @@ async def list_objects(db: Any, mode: str = "active", query: str | None = None) 
         """,
         params,
     )
+    if not query:
+        return rows
+
+    needle = query.strip().casefold()
+    if not needle:
+        return rows[:60]
+
+    def matches(row: aiosqlite.Row) -> bool:
+        values = (row["title"], row["client"], row["address"], row["client_phone"])
+        return any(needle in str(value or "").casefold() for value in values)
+
+    return [row for row in rows if matches(row)][:60]
 
 
 CATEGORY_OPTIONS = {
@@ -439,6 +478,24 @@ def object_details_markup(data: dict[str, Any]) -> InlineKeyboardMarkup:
     )
 
 
+def contact_details_markup(data: dict[str, Any]) -> InlineKeyboardMarkup:
+    def mark(value: Any, title: str) -> str:
+        return ("✅ " if value else "➕ ") + title
+
+    return inline(
+        [
+            [
+                (mark(data.get("client_name"), "Имя"), "v3_ocontact:name"),
+                (mark(data.get("client_phone"), "Телефон"), "v3_ocontact:phone"),
+            ],
+            [(mark(data.get("client_telegram"), "Telegram"), "v3_ocontact:telegram")],
+            [("⬅️ Назад к подробностям", "v3_odetails")],
+            [("✅ Создать объект", "v3_ocreate")],
+            [("❌ Отмена", "v3_cancel")],
+        ]
+    )
+
+
 def compact_objects_markup(
     rows: Sequence[aiosqlite.Row],
 ) -> InlineKeyboardMarkup:
@@ -469,22 +526,19 @@ def compact_objects_text(rows: Sequence[aiosqlite.Row], tz: Any, title: str) -> 
         else:
             due_text = "без срока"
         tasks = f"{row['done_tasks']} из {row['total_tasks']}"
+        category = str(row["category"] or "📌 Другое")[:50]
+        object_title = str(row["title"] or "Без названия")
+        if len(object_title) > 90:
+            object_title = object_title[:87] + "…"
         lines.extend(
             [
                 "",
-                f"<b>{index}. {html.escape(row['category'] or '📌 Другое')} — {html.escape(row['title'])}</b>",
+                f"<b>{index}. {html.escape(category)} — {html.escape(object_title)}</b>",
                 f"{status} · {due_text}",
                 f"✅ Задачи: {tasks}",
             ]
         )
     return "\n".join(lines)
-
-
-def compact_objects_markup(rows: Sequence[aiosqlite.Row]) -> InlineKeyboardMarkup:
-    return inline(
-        [[(f"{index}. {str(row['title'])[:42]}", f"v3_openobj:{row['id']}")]]
-        for index, row in enumerate(rows, start=1)
-    )
 
 
 def users_markup(rows: Sequence[aiosqlite.Row], prefix: str, allow_none: bool = False) -> InlineKeyboardMarkup:
@@ -1360,11 +1414,12 @@ def register_extension_handlers(router: Router) -> None:
         if not callback.message:
             return
         if rows:
-            lines = ["🤝 <b>Договорённости</b>"]
+            await callback.message.answer("🤝 <b>Договорённости</b>")
             for row in reversed(rows):
                 when = dt_from_iso(row["created_at_utc"]).astimezone(settings.timezone).strftime("%d.%m %H:%M")
-                lines.append(f"\n{when} — {html.escape(row['text'])}\n<i>{html.escape(row['creator_name'])}</i>")
-            await callback.message.answer("\n".join(lines))
+                await callback.message.answer(
+                    f"{when} — {html.escape(row['text'])}\n<i>{html.escape(row['creator_name'])}</i>"
+                )
         else:
             await callback.message.answer("Договорённостей пока нет.")
         if admin:
@@ -1528,6 +1583,9 @@ def register_extension_handlers(router: Router) -> None:
     @router.callback_query(TaskAddForm.priority, F.data.startswith("v3_tpr:"))
     async def v3_task_create(callback: CallbackQuery, state: FSMContext, db: Any, settings: Any) -> None:
         priority = callback.data.split(":", 1)[1]
+        if priority not in {"normal", "high", "urgent"}:
+            await callback.answer("Неизвестный приоритет", show_alert=True)
+            return
         uid = await actor_id(callback, db)
         data = await state.get_data()
         due = dt_from_iso(data["due_at_utc"])
@@ -1814,6 +1872,9 @@ def register_extension_handlers(router: Router) -> None:
     @router.callback_query(WorkshopForm.category, F.data.startswith("v3_wc:"))
     async def v3_workshop_category(callback: CallbackQuery, state: FSMContext) -> None:
         key = callback.data.split(":", 1)[1]
+        if key not in WORKSHOP_CATEGORIES:
+            await callback.answer("Категория не найдена", show_alert=True)
+            return
         await state.update_data(category=WORKSHOP_CATEGORIES[key])
         await state.set_state(WorkshopForm.title)
         await callback.answer()
@@ -1886,7 +1947,11 @@ def register_extension_handlers(router: Router) -> None:
 
     @router.callback_query(WorkshopForm.priority, F.data.startswith("v3_wpr:"))
     async def v3_workshop_priority(callback: CallbackQuery, state: FSMContext) -> None:
-        await state.update_data(priority=callback.data.split(":", 1)[1])
+        priority = callback.data.split(":", 1)[1]
+        if priority not in {"normal", "high", "urgent"}:
+            await callback.answer("Неизвестный приоритет", show_alert=True)
+            return
+        await state.update_data(priority=priority)
         await state.set_state(WorkshopForm.repeat)
         await callback.answer()
         if callback.message:
@@ -1904,6 +1969,9 @@ def register_extension_handlers(router: Router) -> None:
     @router.callback_query(WorkshopForm.repeat, F.data.startswith("v3_wr:"))
     async def v3_workshop_create(callback: CallbackQuery, state: FSMContext, db: Any, settings: Any) -> None:
         repeat_rule = callback.data.split(":", 1)[1]
+        if repeat_rule not in {"none", "weekly", "monthly"}:
+            await callback.answer("Неизвестное правило повтора", show_alert=True)
+            return
         uid = await actor_id(callback, db)
         data = await state.get_data()
         due = dt_from_iso(data["due_at_utc"])
@@ -1946,6 +2014,8 @@ def register_extension_handlers(router: Router) -> None:
             where.append("t.status='done'")
         elif mode == "regular":
             where += ["t.status<>'done'", "t.repeat_rule<>'none'"]
+        if not where:
+            where.append("1=1")
         rows = await db.fetchall(
             f"""SELECT t.*,a.full_name assignee_name,a.telegram_id assignee_telegram_id,
                        c.full_name creator_name,c.telegram_id creator_telegram_id
@@ -2005,10 +2075,10 @@ def register_extension_handlers(router: Router) -> None:
             await callback.answer("Недостаточно прав", show_alert=True)
             return
         await db.set_todo_status(wid, "done")
-        # Для регулярного дела создаём следующий экземпляр.
+        # Для регулярного дела создаём ближайший будущий экземпляр.
         if row["repeat_rule"] in {"weekly", "monthly"}:
             old_due = dt_from_iso(row["due_at_utc"])
-            next_due = old_due + (timedelta(days=7) if row["repeat_rule"] == "weekly" else timedelta(days=30))
+            next_due = next_repeat_due(old_due, str(row["repeat_rule"]))
             new_id = await db.create_todo(
                 int(row["chat_id"]), row["title"], int(row["assignee_id"]), int(row["creator_id"]),
                 row["priority"], next_due,
@@ -2018,9 +2088,11 @@ def register_extension_handlers(router: Router) -> None:
                 (row["category"], row["description"], row["repeat_rule"], row["has_due"], new_id),
             )
             if int(row["has_due"]):
+                targets = {int(row["assignee_telegram_id"]), int(row["creator_telegram_id"])}
+                if settings.work_chat_id:
+                    targets.add(int(settings.work_chat_id))
                 await db.schedule_entity_reminders(
-                    "todo", new_id, int(row["creator_id"]),
-                    {int(row["assignee_telegram_id"]), int(row["creator_telegram_id"])}, row["title"], next_due,
+                    "todo", new_id, int(row["creator_id"]), targets, row["title"], next_due,
                 )
         updated = await db.todo_by_id(wid)
         await callback.answer("Дело выполнено")
@@ -2125,15 +2197,16 @@ def register_extension_handlers(router: Router) -> None:
         data = await state.get_data()
         oid = int(data["object_id"])
         photo = message.photo[-1]
-        folder = settings.portfolio_dir / f"order_{oid}"
-        folder.mkdir(parents=True, exist_ok=True)
-        safe = re.sub(r"[^A-Za-z0-9_-]", "_", photo.file_unique_id)
-        target = folder / f"{datetime.now(settings.timezone):%Y%m%d_%H%M%S_%f}_{safe}.jpg"
         local_path: str | None = None
         try:
+            folder = settings.portfolio_dir / f"order_{oid}"
+            folder.mkdir(parents=True, exist_ok=True)
+            safe = re.sub(r"[^A-Za-z0-9_-]", "_", photo.file_unique_id)
+            target = folder / f"{datetime.now(settings.timezone):%Y%m%d_%H%M%S_%f}_{safe}.jpg"
             await bot.download(photo, destination=target)
             local_path = str(target)
         except Exception:
+            # Даже если локальный диск недоступен, Telegram file_id всё равно сохраняется в базе.
             logging.exception("Не удалось сохранить локальную копию фото")
         pid = await db.execute(
             """INSERT INTO portfolio_photos(
@@ -2377,6 +2450,9 @@ def register_extension_handlers(router: Router) -> None:
     @router.callback_query(ExpenseFormV3.link_type, F.data.startswith("v3_exlink:"))
     async def v3_expense_link_type(callback: CallbackQuery, state: FSMContext, db: Any) -> None:
         link_type = callback.data.split(":", 1)[1]
+        if link_type not in {"object", "workshop", "none"}:
+            await callback.answer("Неизвестный тип привязки", show_alert=True)
+            return
         await state.update_data(link_type=link_type)
         await callback.answer()
         if link_type == "none":
@@ -2415,6 +2491,9 @@ def register_extension_handlers(router: Router) -> None:
     @router.callback_query(ExpenseFormV3.category, F.data.startswith("v3_exc:"))
     async def v3_expense_category(callback: CallbackQuery, state: FSMContext) -> None:
         index = int(callback.data.split(":", 1)[1])
+        if not 0 <= index < len(EXPENSE_CATEGORIES):
+            await callback.answer("Категория устарела. Откройте список заново.", show_alert=True)
+            return
         await state.update_data(category=EXPENSE_CATEGORIES[index])
         await state.set_state(ExpenseFormV3.amount)
         await callback.answer()
@@ -2480,6 +2559,7 @@ def register_extension_handlers(router: Router) -> None:
                 (eid, file_id, now_iso()),
             )
         await state.clear()
+        RECEIPT_LOCKS.pop(message.from_user.id, None)
         receipt_text = f" Фото чека: {len(receipts)}." if receipts else " Без чека."
         await message.answer(f"✅ Расход №{eid} записан.{receipt_text}")
 
@@ -2525,7 +2605,7 @@ def register_extension_handlers(router: Router) -> None:
                        (SELECT COUNT(*) FROM expense_receipts er WHERE er.expense_id=e.id) receipt_count
                 FROM expenses e JOIN users u ON u.id=e.created_by
                 LEFT JOIN orders o ON o.id=e.order_id LEFT JOIN todos t ON t.id=e.todo_id
-                WHERE e.deleted=0 AND {clause} ORDER BY e.id DESC LIMIT 40""",
+                WHERE e.deleted=0 AND ({clause}) ORDER BY e.id DESC LIMIT 40""",
             values,
         )
         if not rows:
@@ -2609,6 +2689,7 @@ def register_extension_handlers(router: Router) -> None:
             (receipts[0], expense_id),
         )
         await state.clear()
+        RECEIPT_LOCKS.pop(message.from_user.id, None)
         await message.answer(f"✅ К расходу №{expense_id} добавлено фото: {len(receipts)}.")
 
     @router.message(ReceiptAddForm.photos)
@@ -2764,6 +2845,13 @@ def register_extension_handlers(router: Router) -> None:
         def csv_amount(value: Decimal) -> str:
             return f"{value.quantize(Decimal('0.01')):.2f}".replace(".", ",")
 
+        def csv_safe(value: Any) -> str:
+            text_value = str(value or "")
+            # Защита от выполнения формул при открытии CSV в Excel/LibreOffice.
+            if text_value.lstrip().startswith(("=", "+", "-", "@")):
+                return "'" + text_value
+            return text_value
+
         output = io.StringIO(newline="")
         writer = csv.writer(output, delimiter=";", lineterminator="\r\n")
         writer.writerow(["Финансовая выгрузка"])
@@ -2793,12 +2881,12 @@ def register_extension_handlers(router: Router) -> None:
                     item["type"],
                     item["id"],
                     item["date"],
-                    item["object"],
-                    item["workshop"],
-                    item["kind"],
-                    item["description"],
+                    csv_safe(item["object"]),
+                    csv_safe(item["workshop"]),
+                    csv_safe(item["kind"]),
+                    csv_safe(item["description"]),
                     csv_amount(item["amount"]),
-                    item["creator"],
+                    csv_safe(item["creator"]),
                     item["receipt"],
                     item["receipt_count"],
                 ]
@@ -2840,6 +2928,9 @@ def register_extension_handlers(router: Router) -> None:
             await callback.answer("Только администратор", show_alert=True)
             return
         choice = callback.data.split(":", 1)[1]
+        if choice not in {"today", "month", "all", "custom"}:
+            await callback.answer("Неизвестный период", show_alert=True)
+            return
         today = datetime.now(settings.timezone).date()
         await callback.answer()
         if choice == "custom":
@@ -2950,6 +3041,9 @@ def register_extension_handlers(router: Router) -> None:
     @router.callback_query(IncomeFormV3.payment_type, F.data.startswith("v3_income_t:"))
     async def v3_income_type(callback: CallbackQuery, state: FSMContext) -> None:
         index = int(callback.data.split(":", 1)[1])
+        if not 0 <= index < len(INCOME_TYPES):
+            await callback.answer("Тип платежа устарел. Откройте список заново.", show_alert=True)
+            return
         await state.update_data(payment_type=INCOME_TYPES[index])
         await state.set_state(IncomeFormV3.description)
         await callback.answer()
@@ -3055,7 +3149,20 @@ def register_extension_handlers(router: Router) -> None:
             await state.clear()
             await message.answer("Поле не поддерживается.")
             return
-        value = None if (message.text or "").strip() == "-" else (message.text or "").strip()[:1500]
+        raw_value = (message.text or "").strip()
+        if field in {"category", "title"} and (raw_value == "-" or len(raw_value) < 2):
+            await message.answer("Категорию и название нельзя очистить. Введите минимум 2 символа.")
+            return
+        limits = {
+            "category": 80,
+            "title": 200,
+            "address": 300,
+            "description": 1500,
+            "client": 200,
+            "client_phone": 100,
+            "client_telegram": 100,
+        }
+        value = None if raw_value == "-" else raw_value[:limits[field]]
         await db.execute(f"UPDATE orders SET {field}=?,updated_at_utc=? WHERE id=?", (value, now_iso(), int(data["object_id"])))
         oid = int(data["object_id"])
         await state.clear()
