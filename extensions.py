@@ -439,16 +439,17 @@ def object_details_markup(data: dict[str, Any]) -> InlineKeyboardMarkup:
     )
 
 
-def contact_details_markup(data: dict[str, Any]) -> InlineKeyboardMarkup:
-    def mark(value: Any, title: str) -> str:
-        return ("✅ " if value else "➕ ") + title
+def compact_objects_markup(
+    rows: Sequence[aiosqlite.Row],
+) -> InlineKeyboardMarkup:
     return inline(
         [
-            [(mark(data.get("client_name"), "Имя"), "v3_ocontact:name")],
-            [(mark(data.get("client_phone"), "Телефон"), "v3_ocontact:phone")],
-            [(mark(data.get("client_telegram"), "Telegram"), "v3_ocontact:telegram")],
-            [("⬅️ К подробностям", "v3_odetails")],
+            (
+                f"{index}. {str(row['title'])[:42]}",
+                f"v3_openobj:{row['id']}",
+            )
         ]
+        for index, row in enumerate(rows, start=1)
     )
 
 
