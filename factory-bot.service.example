@@ -1,0 +1,16 @@
+[Unit]
+Description=Telegram bot for Fabrika Detalei
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/fabrika-detalei-bot
+ExecStart=/opt/fabrika-detalei-bot/.venv/bin/python /opt/fabrika-detalei-bot/bot.py
+Restart=always
+RestartSec=5
+EnvironmentFile=/opt/fabrika-detalei-bot/.env
+
+[Install]
+WantedBy=multi-user.target
