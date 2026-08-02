@@ -3395,6 +3395,111 @@ def register_extension_handlers(router: Router) -> None:
         await message.answer("✅ Рабочее имя изменено.", reply_markup=staff_menu())
 
     # -----------------------------------------------------------------------
+    # Управление уведомлениями о просрочке
+    # -----------------------------------------------------------------------
+
+    async def overdue_entity_access(
+        entity_type: str,
+        entity_id: int,
+        user_id: int,
+        db: Any,
+        settings: Any,
+    ) -> tuple[aiosqlite.Row | None, bool]:
+        if entity_type == "task":
+            row = await db.task_by_id(entity_id)
+        else:
+            row = await db.todo_by_id(entity_id)
+        if not row:
+            return None, False
+        allowed = (
+            user_id in {
+                int(row["assignee_telegram_id"]),
+                int(row["creator_telegram_id"]),
+            }
+            or await is_admin(user_id, db, settings)
+        )
+        return row, allowed
+
+    @router.callback_query(F.data.regexp(r"^v3_overdue_tomorrow:(task|todo):\d+$"))
+    async def v3_overdue_tomorrow(
+        callback: CallbackQuery,
+        db: Any,
+        settings: Any,
+    ) -> None:
+        _, entity_type, entity_id_text = callback.data.split(":", 2)
+        entity_id = int(entity_id_text)
+        row, allowed = await overdue_entity_access(
+            entity_type, entity_id, callback.from_user.id, db, settings
+        )
+        if not row:
+            await callback.answer("Задача или дело не найдено", show_alert=True)
+            return
+        if not allowed:
+            await callback.answer("Недостаточно прав", show_alert=True)
+            return
+
+        await db.cancel_entity_reminders(entity_type, entity_id)
+        local_now = datetime.now(settings.timezone)
+        remind_local = (local_now + timedelta(days=1)).replace(
+            hour=9, minute=0, second=0, microsecond=0
+        )
+        remind_utc = remind_local.astimezone(timezone.utc)
+        creator_id = await actor_id(callback, db)
+        label = "Задача" if entity_type == "task" else "Дело"
+        await db.add_reminder(
+            entity_type,
+            entity_id,
+            creator_id,
+            callback.message.chat.id if callback.message else callback.from_user.id,
+            f"{label} №{entity_id}: {row['title']}. Повторное напоминание о просрочке.",
+            remind_utc,
+        )
+        table = "tasks" if entity_type == "task" else "todos"
+        await db.execute(
+            f"UPDATE {table} SET last_overdue_notice_date=? WHERE id=?",
+            ("snoozed", entity_id),
+        )
+        await callback.answer("Напомню завтра в 09:00")
+        if callback.message:
+            await callback.message.edit_reply_markup(reply_markup=None)
+            await callback.message.answer(
+                f"⏰ Повторное напоминание назначено на "
+                f"{remind_local.strftime('%d.%m.%Y %H:%M')}."
+            )
+
+    @router.callback_query(F.data.regexp(r"^v3_overdue_mute:(task|todo):\d+$"))
+    async def v3_overdue_mute(
+        callback: CallbackQuery,
+        db: Any,
+        settings: Any,
+    ) -> None:
+        _, entity_type, entity_id_text = callback.data.split(":", 2)
+        entity_id = int(entity_id_text)
+        row, allowed = await overdue_entity_access(
+            entity_type, entity_id, callback.from_user.id, db, settings
+        )
+        if not row:
+            await callback.answer("Задача или дело не найдено", show_alert=True)
+            return
+        if not allowed:
+            await callback.answer("Недостаточно прав", show_alert=True)
+            return
+
+        await db.cancel_entity_reminders(entity_type, entity_id)
+        table = "tasks" if entity_type == "task" else "todos"
+        await db.execute(
+            f"UPDATE {table} SET last_overdue_notice_date=? WHERE id=?",
+            ("disabled", entity_id),
+        )
+        await callback.answer("Уведомления отключены")
+        if callback.message:
+            await callback.message.edit_reply_markup(reply_markup=None)
+            await callback.message.answer(
+                "🔕 Повторные уведомления по этой просрочке отключены. "
+                "Она останется в разделе просроченных до выполнения."
+            )
+
+    # -----------------------------------------------------------------------
     # Общие callback-заглушки
     # -----------------------------------------------------------------------
 
