@@ -41,71 +41,6 @@ from dotenv import load_dotenv
 # ---------------------------------------------------------------------------
 
 
-MINUS_TRANSLATION = str.maketrans(
-    {
-        "−": "-",  # математический минус
-        "–": "-",  # короткое тире
-        "—": "-",  # длинное тире
-        "‑": "-",  # неразрывный дефис
-        "﹣": "-",
-        "－": "-",
-    }
-)
-
-
-def parse_env_int(
-    raw: str | None,
-    variable_name: str,
-    *,
-    group_chat: bool = False,
-) -> int | None:
-    """Надёжно читает числовой ID из переменной окружения.
-
-    Принимает обычное число, число в кавычках и запись вида
-    ``WORK_CHAT_ID=-123``. Для ID групп положительное значение
-    автоматически преобразуется в отрицательное.
-    """
-    value = (raw or "").strip().translate(MINUS_TRANSLATION)
-    if not value:
-        return None
-
-    if "=" in value:
-        left, right = value.split("=", 1)
-        if left.strip().upper() == variable_name.upper():
-            value = right
-
-    value = value.strip().strip("\"'").replace("\u00a0", "").replace(" ", "")
-    if not value:
-        return None
-    if not re.fullmatch(r"[+-]?\d+", value):
-        raise RuntimeError(
-            f"Переменная {variable_name} должна содержать только числовой ID, "
-            f"получено: {raw!r}"
-        )
-
-    result = int(value)
-    if result == 0:
-        raise RuntimeError(f"Переменная {variable_name} не может быть равна 0")
-    if group_chat and result > 0:
-        logging.warning(
-            "%s указан без минуса (%s). Использую значение -%s.",
-            variable_name,
-            result,
-            result,
-        )
-        result = -result
-    return result
-
-
-def is_configured_work_chat(chat_id: int, configured_chat_id: int | None) -> bool:
-    """Проверяет, совпадает ли текущая группа с WORK_CHAT_ID."""
-    if configured_chat_id is None:
-        return False
-    return chat_id == configured_chat_id or (
-        chat_id < 0 and abs(chat_id) == abs(configured_chat_id)
-    )
-
-
 @dataclass(frozen=True, slots=True)
 class Settings:
     bot_token: str
@@ -130,19 +65,15 @@ class Settings:
         except ZoneInfoNotFoundError as exc:
             raise RuntimeError(f"Неизвестный часовой пояс TIMEZONE={timezone_name}") from exc
 
-        work_chat_id = parse_env_int(
-            os.getenv("WORK_CHAT_ID", ""),
-            "WORK_CHAT_ID",
-            group_chat=True,
-        )
+        work_chat_raw = os.getenv("WORK_CHAT_ID", "").strip()
+        work_chat_id = int(work_chat_raw) if work_chat_raw else None
 
         def parse_ids(raw: str) -> frozenset[int]:
             result: set[int] = set()
-            normalized = raw.replace(";", ",").replace("\n", ",")
-            for value in normalized.split(","):
-                parsed = parse_env_int(value, "ID")
-                if parsed is not None:
-                    result.add(parsed)
+            for value in raw.split(","):
+                value = value.strip()
+                if value:
+                    result.add(int(value))
             return frozenset(result)
 
         admin_ids = parse_ids(os.getenv("ADMIN_IDS", ""))
@@ -1094,14 +1025,8 @@ class Database:
 
     async def cancel_reminder(self, reminder_id: int, creator_id: int | None = None) -> bool:
         if creator_id is None:
-            row = await self.fetchone("SELECT id FROM reminders WHERE id=?", (reminder_id,))
-            if not row:
-                return False
-            await self.execute(
-                "UPDATE reminders SET cancelled=1 WHERE id=?",
-                (reminder_id,),
-            )
-            return True
+            changed = await self.execute("UPDATE reminders SET cancelled=1 WHERE id=?", (reminder_id,))
+            return changed >= 0
         row = await self.fetchone(
             "SELECT id FROM reminders WHERE id=? AND creator_id=? AND entity_type='custom'",
             (reminder_id, creator_id),
@@ -1136,10 +1061,10 @@ class Database:
             SELECT t.*, a.telegram_id AS assignee_telegram_id, a.full_name AS assignee_name
             FROM tasks t JOIN users a ON a.id=t.assignee_id
             WHERE t.status <> 'done' AND t.due_at_utc < ?
-              AND (t.last_overdue_notice_date IS NULL OR t.last_overdue_notice_date <> ?)
+              AND t.last_overdue_notice_date IS NULL
             ORDER BY t.due_at_utc LIMIT 100
             """,
-            (utc_iso(now), local_day.isoformat()),
+            (utc_iso(now),),
         )
 
     async def overdue_todos(self, now: datetime, local_day: date) -> list[aiosqlite.Row]:
@@ -1148,10 +1073,10 @@ class Database:
             SELECT t.*, a.telegram_id AS assignee_telegram_id, a.full_name AS assignee_name
             FROM todos t JOIN users a ON a.id=t.assignee_id
             WHERE t.status <> 'done' AND t.due_at_utc < ?
-              AND (t.last_overdue_notice_date IS NULL OR t.last_overdue_notice_date <> ?)
+              AND t.last_overdue_notice_date IS NULL
             ORDER BY t.due_at_utc LIMIT 100
             """,
-            (utc_iso(now), local_day.isoformat()),
+            (utc_iso(now),),
         )
 
     async def mark_overdue_notified(self, entity_type: str, entity_id: int, local_day: date) -> None:
@@ -1513,31 +1438,8 @@ class AccessMiddleware(BaseMiddleware):
             if event.chat.type != ChatType.PRIVATE:
                 if text.startswith("/chatid") and is_admin:
                     return await handler(event, data)
-                if not is_configured_work_chat(event.chat.id, settings.work_chat_id):
-                    logging.warning(
-                        "Отклонён групповой чат: actual_chat_id=%s, WORK_CHAT_ID=%s, "
-                        "chat_type=%s, user_id=%s",
-                        event.chat.id,
-                        settings.work_chat_id,
-                        event.chat.type,
-                        user.id,
-                    )
-                    if is_admin:
-                        configured = (
-                            str(settings.work_chat_id)
-                            if settings.work_chat_id is not None
-                            else "не задан"
-                        )
-                        await event.answer(
-                            "⛔ Этот групповой чат не разрешён для работы бота.\n"
-                            f"ID текущего чата: <code>{event.chat.id}</code>\n"
-                            f"Загруженный WORK_CHAT_ID: <code>{configured}</code>\n"
-                            "Исправьте переменную и полностью перезапустите бота."
-                        )
-                    else:
-                        await event.answer(
-                            "⛔ Этот групповой чат не разрешён для работы бота."
-                        )
+                if settings.work_chat_id is None or event.chat.id != settings.work_chat_id:
+                    await event.answer("⛔ Этот групповой чат не разрешён для работы бота.")
                     return None
 
         if isinstance(event, CallbackQuery):
@@ -1551,18 +1453,8 @@ class AccessMiddleware(BaseMiddleware):
             message = event.message
             chat = getattr(message, "chat", None)
             if chat is not None and chat.type != ChatType.PRIVATE:
-                if not is_configured_work_chat(chat.id, settings.work_chat_id):
-                    logging.warning(
-                        "Отклонён callback из группового чата: actual_chat_id=%s, "
-                        "WORK_CHAT_ID=%s, user_id=%s",
-                        chat.id,
-                        settings.work_chat_id,
-                        user.id,
-                    )
-                    await event.answer(
-                        "Этот чат не разрешён. Отправьте /chatid для проверки настроек.",
-                        show_alert=True,
-                    )
+                if settings.work_chat_id is None or chat.id != settings.work_chat_id:
+                    await event.answer("Этот чат не разрешён", show_alert=True)
                     return None
 
         return await handler(event, data)
@@ -1666,23 +1558,8 @@ async def cmd_id(message: Message) -> None:
 
 
 @router.message(Command("chatid"))
-async def cmd_chat_id(message: Message, settings: Settings) -> None:
-    configured = (
-        str(settings.work_chat_id)
-        if settings.work_chat_id is not None
-        else "не задан"
-    )
-    if message.chat.type == ChatType.PRIVATE:
-        status = "ℹ️ Это личный чат."
-    elif is_configured_work_chat(message.chat.id, settings.work_chat_id):
-        status = "✅ Текущий чат совпадает с WORK_CHAT_ID."
-    else:
-        status = "❌ Текущий чат НЕ совпадает с WORK_CHAT_ID."
-    await message.answer(
-        f"ID этого чата: <code>{message.chat.id}</code>\n"
-        f"Загруженный WORK_CHAT_ID: <code>{configured}</code>\n"
-        f"{status}"
-    )
+async def cmd_chat_id(message: Message) -> None:
+    await message.answer(f"ID этого чата: <code>{message.chat.id}</code>")
 
 
 @router.message(Command("register"))
@@ -2624,8 +2501,24 @@ async def reminder_worker(bot: Bot, db: Database, settings: Settings) -> None:
                 assignee_chat = int(row["assignee_telegram_id"])
                 if await db.is_allowed(assignee_chat):
                     targets.add(assignee_chat)
+                reminder_markup = InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [InlineKeyboardButton(text="✅ Выполнить", callback_data=f"v3_td:{row['id']}")],
+                        [
+                            InlineKeyboardButton(
+                                text="⏰ Напомнить завтра",
+                                callback_data=f"v3_overdue_tomorrow:task:{row['id']}",
+                            ),
+                            InlineKeyboardButton(
+                                text="🔕 Не напоминать",
+                                callback_data=f"v3_overdue_mute:task:{row['id']}",
+                            ),
+                        ],
+                    ]
+                )
                 for target in targets:
-                    await safe_send(bot, target, text)
+                    await safe_send(bot, target, text, reply_markup=reminder_markup)
+                # Просрочка отправляется автоматически только один раз.
                 await db.mark_overdue_notified("task", int(row["id"]), local_day)
 
             for row in await db.overdue_todos(now, local_day):
@@ -2645,8 +2538,24 @@ async def reminder_worker(bot: Bot, db: Database, settings: Settings) -> None:
                 assignee_chat = int(row["assignee_telegram_id"])
                 if await db.is_allowed(assignee_chat):
                     targets.add(assignee_chat)
+                reminder_markup = InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [InlineKeyboardButton(text="✅ Выполнить", callback_data=f"v3_wd:{row['id']}")],
+                        [
+                            InlineKeyboardButton(
+                                text="⏰ Напомнить завтра",
+                                callback_data=f"v3_overdue_tomorrow:todo:{row['id']}",
+                            ),
+                            InlineKeyboardButton(
+                                text="🔕 Не напоминать",
+                                callback_data=f"v3_overdue_mute:todo:{row['id']}",
+                            ),
+                        ],
+                    ]
+                )
                 for target in targets:
-                    await safe_send(bot, target, text)
+                    await safe_send(bot, target, text, reply_markup=reminder_markup)
+                # Просрочка отправляется автоматически только один раз.
                 await db.mark_overdue_notified("todo", int(row["id"]), local_day)
 
         except asyncio.CancelledError:
@@ -2702,15 +2611,7 @@ async def main() -> None:
     await set_bot_commands(bot)
     worker = asyncio.create_task(reminder_worker(bot, db, settings), name="reminder-worker")
     try:
-        logging.info(
-            "Бот запущен. TIMEZONE=%s | WORK_CHAT_ID=%s | DB_PATH=%s | "
-            "ADMIN_IDS=%s | ALLOWED_IDS=%s",
-            settings.timezone_name,
-            settings.work_chat_id,
-            settings.db_path,
-            sorted(settings.admin_ids),
-            sorted(settings.allowed_ids),
-        )
+        logging.info("Бот запущен. Часовой пояс: %s", settings.timezone_name)
         await dp.start_polling(
             bot,
             db=db,
